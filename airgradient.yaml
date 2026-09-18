@@ -1,0 +1,367 @@
+substitutions:
+  device_name: "airgradient"
+  friendly_name: "AirGradient"
+  # The SHT3x sometimes wedges. Reboot if it has not produced a plausible
+  # reading for 10 update intervals (10 x 15s), as the old firmware did.
+  sht_watchdog_timeout: "150000"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  # Both sensors are on bit-banged software UARTs (neither sits on the ESP8266's
+  # one hardware UART). ESPHome samples those bits from a busy-wait started at
+  # ISR entry, so any interrupt latency shifts every sample and corrupts the
+  # byte. Running the CPU at 160MHz halves that latency and doubles the timing
+  # resolution of the sampler; at 80MHz both UARTs return garbage.
+  platformio_options:
+    board_build.f_cpu: "160000000L"
+  on_boot:
+    priority: -100
+    then:
+      # Start the SHT3x watchdog clock at boot so it cannot fire before the
+      # sensor has had a chance to report.
+      - lambda: "id(sht_last_ok) = millis();"
+      # Paint the warm-up screen immediately rather than waiting for the first
+      # 3s redraw tick.
+      - component.update: oled
+
+esp8266:
+  board: d1_mini
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: WPA2
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+mdns:
+
+api:
+  encryption:
+    key: !secret encryption_key
+
+ota:
+  platform: esphome
+  encryption:
+
+logger:
+  level: INFO
+  # Pin the logger to UART0 so it can never claim UART1 (GPIO2), which the
+  # SenseAir S8 needs as its RX pin.
+  hardware_uart: UART0
+
+# The SHT3x and the OLED share the bus. Both are rated for 400 kHz, which keeps
+# the bit-banged OLED frame write short enough to stay out of the loop's way.
+i2c:
+  sda: GPIO4 # D2
+  scl: GPIO5 # D1
+  frequency: 400kHz
+  scan: true
+
+uart:
+  # PMS5003: ESP RX on D5, ESP TX on D6. 32-byte frames arrive continuously, so
+  # give the software UART some headroom.
+  - id: uart_pms
+    rx_pin: GPIO14 # D5
+    tx_pin: GPIO12 # D6
+    baud_rate: 9600
+    rx_buffer_size: 512
+
+  # SenseAir S8: ESP RX on D4, ESP TX on D3.
+  - id: uart_s8
+    rx_pin: GPIO2 # D4
+    tx_pin: GPIO0 # D3
+    baud_rate: 9600
+
+globals:
+  - id: oled_page
+    type: int
+    initial_value: "0"
+  - id: oled_inverted
+    type: bool
+    initial_value: "false"
+  # millis() of the last plausible SHT3x reading; drives the stuck-sensor reboot.
+  - id: sht_last_ok
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+number:
+  - platform: template
+    id: temp_offset
+    name: "Temperature Offset"
+    entity_category: config
+    unit_of_measurement: "°C"
+    # Deliberately no device_class. These are offsets -- temperature
+    # *differences* -- not temperatures. With device_class: temperature, Home
+    # Assistant treats the value as an absolute reading and unit-converts it, so
+    # -3.2 C displays as 26.2 F and editing it in HA writes back a converted
+    # number. Without it, HA shows the raw value and the unit as a plain label.
+    optimistic: true
+    restore_value: true
+    initial_value: -3.2
+    min_value: -20
+    max_value: 20
+    step: 0.1
+    mode: box
+
+  - platform: template
+    id: hum_offset
+    name: "Humidity Offset"
+    entity_category: config
+    unit_of_measurement: "%"
+    # No device_class, for the same reason as the temperature offset above.
+    optimistic: true
+    restore_value: true
+    initial_value: 14
+    min_value: -50
+    max_value: 50
+    step: 1
+    mode: box
+
+sensor:
+  - platform: pmsx003
+    type: PMSX003
+    uart_id: uart_pms
+    # Active/free-running, as the old firmware ran it. Do NOT set update_interval
+    # here: anything above 30s puts the sensor in passive sleep/wake mode, where
+    # every reading depends on a wake command reaching the sensor over the
+    # software UART. When that command is missed the fan stays down and the
+    # sensor dutifully reports 0 ug/m3 for everything. Free-running needs no
+    # commands at all, so there is nothing to miss.
+    pm_1_0:
+      id: pm_1_0
+      name: "PM1"
+      filters:
+        - throttle: 20s
+    pm_2_5:
+      id: pm_2_5
+      name: "PM2.5"
+      filters:
+        - throttle: 20s
+    pm_10_0:
+      id: pm_10_0
+      name: "PM10"
+      filters:
+        - throttle: 20s
+
+  - platform: sht3xd
+    address: 0x44
+    update_interval: 15s
+    temperature:
+      id: temperature
+      name: "Temperature"
+      filters:
+        # A wedged SHT3x returns zeroed registers, which decode to -45C (the
+        # bottom of the sensor's range) rather than the 0.00 the old firmware's
+        # library reported. Reject that and anything else out of range.
+        - lambda: |-
+            if (std::isnan(x) || x <= -40.0f || x >= 85.0f)
+              return {};
+            return x + (std::isnan(id(temp_offset).state) ? 0.0f : id(temp_offset).state);
+    humidity:
+      id: humidity
+      name: "Humidity"
+      filters:
+        # Zeroed registers decode to 0% RH -- the same tell the old firmware
+        # used. Temperature and humidity come out of one I2C transaction, so a
+        # plausible humidity reading is what marks the whole sensor alive.
+        - lambda: |-
+            if (std::isnan(x) || x <= 0.0f || x > 100.0f)
+              return {};
+            id(sht_last_ok) = millis();
+            return x + (std::isnan(id(hum_offset).state) ? 0.0f : id(hum_offset).state);
+
+  - platform: senseair
+    uart_id: uart_s8
+    # Both UARTs are bit-banged, so a PMS frame arriving mid-reply corrupts the
+    # S8's framing. Room CO2 moves slowly; reading less often means fewer
+    # collisions to lose.
+    update_interval: 60s
+    co2:
+      id: co2
+      name: "CO2"
+      filters:
+        # The S8 reports non-positive values when it is in a bad state; drop them
+        # so the entity holds its last good reading.
+        - lambda: |-
+            if (std::isnan(x) || x <= 0.0f)
+              return {};
+            return x;
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    entity_category: diagnostic
+    update_interval: 60s
+
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+    update_interval: 60s
+
+button:
+  - platform: restart
+    id: restart_button
+    name: "Restart"
+    entity_category: diagnostic
+
+  - platform: safe_mode
+    name: "Safe Mode Boot"
+    entity_category: diagnostic
+
+font:
+  # These BDF files are the literal Adobe Helvetica X11 bitmap sources u8g2
+  # compiled its helvR* fonts from (github.com/olikraus/u8g2, tools/font/bdf),
+  # so glyphs render pixel-identical to the old firmware's u8g2_font_helvR*
+  # fonts rather than an outline-font approximation.
+  #
+  # Each id is named for its CAP_HEIGHT in pixels, which is what the old
+  # firmware positioned baselines with. That's *not* always the number in the
+  # source u8g2 font name -- helvR18's actual cap height is 19px and helvR10's
+  # is 11px, so those become font_19 and font_11, not font_18/font_10. A BDF
+  # embeds a single fixed size, so `size` is omitted.
+  - file: fonts/helvR18.bdf
+    id: font_19 # = u8g2_font_helvR18_tf, CAP_HEIGHT 19
+    # Digits, punctuation, and the letters used by the labels ("CO2", "PM 2.5",
+    # "°F", "Hum") and the warm-up screen ("Warm Up", "Serial#", MAC hex).
+    glyphs: &glyphs "0123456789.-+%#° CFHMOPSUWabcdefilmpru"
+  - file: fonts/helvR14.bdf
+    id: font_14 # = u8g2_font_helvR14_tf, CAP_HEIGHT 14
+    glyphs: *glyphs
+  - file: fonts/helvR12.bdf
+    id: font_12 # = u8g2_font_helvR12_tf, CAP_HEIGHT 12
+    glyphs: *glyphs
+  - file: fonts/helvR10.bdf
+    id: font_11 # = u8g2_font_helvR10_tf, CAP_HEIGHT 11; used for the boot/warm-up screen
+    glyphs: *glyphs
+  - file: fonts/helvR08.bdf
+    id: font_8 # = u8g2_font_helvR08_tf, CAP_HEIGHT 8
+    glyphs: *glyphs
+
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SSD1306 64x48"
+    address: 0x3C
+    contrast: 29.5% # = 75/255, the old firmware's setContrast(75)
+    # Redrawn explicitly from the 3s page-flip interval below, exactly as the old
+    # firmware did. A free-running 1s redraw tripled the bit-banged I2C traffic
+    # for no visible benefit and drifted out of phase with the page flip.
+    update_interval: never
+    lambda: |-
+      // Wear levelling: rather than the compile-time `invert:` option, fill the
+      // frame and draw in the opposite colour, exactly as the old firmware did.
+      const Color bg = id(oled_inverted) ? COLOR_ON : COLOR_OFF;
+      const Color fg = id(oled_inverted) ? COLOR_OFF : COLOR_ON;
+      it.fill(bg);
+
+      // Warm-up screen, shown until the PM sensor produces its first reading.
+      if (!id(pm_2_5).has_state()) {
+        std::string serial = get_mac_address().substr(6);
+        it.print(1, 12, id(font_11), fg, TextAlign::BASELINE_LEFT, "Warm Up");
+        it.print(1, 29, id(font_11), fg, TextAlign::BASELINE_LEFT, "Serial#");
+        it.print(1, 46, id(font_11), fg, TextAlign::BASELINE_LEFT, serial.c_str());
+        return;
+      }
+
+      // Right-aligned value with the same font ladder the old firmware used:
+      // shrink until the string fits the 64px-wide panel. `top` selects the upper
+      // or lower half of the screen.
+      auto draw_value = [&](const std::string &value, bool top) {
+        display::BaseFont *font = id(font_19);
+        int font_height = 19, x_inset = 0, y_inset = 0;
+        int x1, y1, width, height;
+
+        it.get_text_bounds(0, 0, value.c_str(), font, TextAlign::TOP_LEFT, &x1, &y1, &width, &height);
+        if (width >= 40) {
+          font = id(font_14);
+          font_height = 14;
+          x_inset = 1;
+          y_inset = 0;
+          it.get_text_bounds(0, 0, value.c_str(), font, TextAlign::TOP_LEFT, &x1, &y1, &width, &height);
+        }
+        if (width >= 40) {
+          font = id(font_12);
+          font_height = 12;
+          x_inset = 0;
+          y_inset = 1;
+        }
+
+        int y = font_height + y_inset + (top ? 0 : 24);
+        it.print(64 - x_inset, y, font, fg, TextAlign::BASELINE_RIGHT, value.c_str());
+      };
+
+      char buf[16];
+
+      if (id(oled_page) == 0) {
+        it.print(1, 9, id(font_8), fg, TextAlign::BASELINE_LEFT, "CO2");
+        if (id(co2).has_state()) {
+          snprintf(buf, sizeof(buf), "%.0f", id(co2).state);
+          draw_value(buf, true);
+        }
+
+        // The old firmware passed "PM\n2.5" to u8g2, which has no newline handling;
+        // render the two lines that were clearly intended.
+        it.print(1, 33, id(font_8), fg, TextAlign::BASELINE_LEFT, "PM");
+        it.print(1, 43, id(font_8), fg, TextAlign::BASELINE_LEFT, "2.5");
+        if (id(pm_2_5).has_state()) {
+          snprintf(buf, sizeof(buf), "%.0f", id(pm_2_5).state);
+          draw_value(buf, false);
+        }
+      } else {
+        // Entities report Celsius and Home Assistant converts; the screen keeps
+        // showing Fahrenheit, matching the old firmware's inF = true.
+        it.print(1, 9, id(font_8), fg, TextAlign::BASELINE_LEFT, "°F");
+        if (id(temperature).has_state()) {
+          snprintf(buf, sizeof(buf), "%.1f", id(temperature).state * 9.0f / 5.0f + 32.0f);
+          draw_value(buf, true);
+        }
+
+        it.print(1, 33, id(font_8), fg, TextAlign::BASELINE_LEFT, "Hum");
+        if (id(humidity).has_state()) {
+          snprintf(buf, sizeof(buf), "%.0f%%", id(humidity).state);
+          draw_value(buf, false);
+        }
+      }
+
+interval:
+  # Page rotation, 3s as in the old firmware, which also redrew on this tick and
+  # only on this tick.
+  - interval: 3s
+    then:
+      - globals.set:
+          id: oled_page
+          value: !lambda "return id(oled_page) == 0 ? 1 : 0;"
+      - component.update: oled
+
+  # OLED wear levelling: flip the polarity every hour.
+  - interval: 3600s
+    then:
+      - globals.set:
+          id: oled_inverted
+          value: !lambda "return !id(oled_inverted);"
+
+  # Stuck-SHT3x watchdog, carried over from the old firmware's reboot-after-10-
+  # bad-reads. It is keyed off elapsed time rather than a counter because a
+  # sensor that stops acknowledging on I2C makes sht3xd publish nothing at all --
+  # there would be no reading to count. This covers both that case and a sensor
+  # that answers with zeroed registers.
+  - interval: 15s
+    then:
+      - if:
+          condition:
+            lambda: "return (millis() - id(sht_last_ok)) > ${sht_watchdog_timeout};"
+          then:
+            - logger.log:
+                level: ERROR
+                format: "No valid SHT3x reading in %u ms, restarting"
+                args: ["(unsigned) (millis() - id(sht_last_ok))"]
+            - button.press: restart_button
+
+safe_mode:
